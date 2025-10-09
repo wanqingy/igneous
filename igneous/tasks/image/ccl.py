@@ -126,10 +126,19 @@ def blackout_non_face_rails(
 
   return labels
 
-def skeleton_based_connected_components(labels, out_dtype=np.uint64, return_N=False):
+def skeleton_based_connected_components_with_oversegment(labels, out_dtype=np.uint64, return_N=False):
     """
-    Skeleton-based connected components using your proven algorithm.
+    Multi-step skeleton-based CCL using oversegment segments attribute:
+    1. Skeletonize
+    2. Remove branch nodes from skeletons
+    3. Use branch-removed skeletons for oversegment to create supervoxels
+    4. Split skeleton components and use segments attribute for accurate regrouping
     """
+    
+    # Set seeds for determinism
+    np.random.seed(42)
+    random.seed(42)
+    
     # Convert to binary
     if labels.dtype != np.bool_:
         binary_labels = labels > 0
@@ -140,11 +149,10 @@ def skeleton_based_connected_components(labels, out_dtype=np.uint64, return_N=Fa
         result = np.zeros_like(labels, dtype=out_dtype)
         return (result, 0) if return_N else result
     
-    # Step 1: Skeletonize using kimimaro
-    # Using minimal TEASAR params for basic skeletonization
+    # Step 1: Skeletonize with deterministic settings
     teasar_params = {
-        'scale': 1.5,
-        'const': 300,
+        'scale': 4,
+        'const': 10,
         'pdrf_scale': 100000,
         'pdrf_exponent': 4,
         'soma_acceptance_threshold': 3500,
@@ -160,18 +168,24 @@ def skeleton_based_connected_components(labels, out_dtype=np.uint64, return_N=Fa
         anisotropy=(1,1,1),
         fix_branching=True,
         fix_borders=True,
-        progress=False
+        progress=False,
+        parallel=1  # Force single-threaded for determinism
     )
     
-    # Step 2: Process skeletons (split at branches and separate components)
-    component_skeletons = []
-    next_id = 1
+    if not skeletons_dict:
+        result = np.zeros_like(labels, dtype=out_dtype)
+        return (result, 0) if return_N else result
     
-    for label, skeleton in skeletons_dict.items():
+    # Step 2: Remove branch nodes from skeletons
+    branch_removed_skeletons = []
+    
+    for label in sorted(skeletons_dict.keys()):
+        skeleton = skeletons_dict[label]
+        
         if len(skeleton.vertices) == 0 or len(skeleton.edges) == 0:
             continue
             
-        # Step 2a: Split at branch points (your method)
+        # Remove branch nodes
         branch_nodes = skeleton.branches()
         
         if len(branch_nodes) > 0:
@@ -207,67 +221,90 @@ def skeleton_based_connected_components(labels, out_dtype=np.uint64, return_N=Fa
             else:
                 split_skeleton.edges = np.array([]).reshape(0, 2)
             
-            # Step 2b: Get components
-            components = split_skeleton.components()
+            # Assign temporary ID for oversegment
+            split_skeleton.id = label
+            branch_removed_skeletons.append(split_skeleton)
         else:
-            components = skeleton.components()
-        
-        # Step 2c: Assign unique IDs to each component
-        for comp in components:
-            if len(comp.vertices) > 1:  # Only meaningful components
-                comp.id = next_id
-                component_skeletons.append(comp)
-                next_id += 1
+            # No branch points, keep original skeleton
+            skeleton.id = label
+            branch_removed_skeletons.append(skeleton)
     
-    # Step 3: Relabel voxels using KNN to nearest skeleton vertex
-    cc_labels = relabel_voxels_with_knn(binary_labels, component_skeletons, out_dtype)
+    # Step 3: Use branch-removed skeletons for oversegmentation
+    try:
+        overseg_labels, updated_skeletons = kimimaro.oversegment(
+            binary_labels,
+            branch_removed_skeletons,
+            anisotropy=(1,1,1),
+            progress=False,
+            fill_holes=False,
+            in_place=False,
+            downsample=0  # No downsampling for accuracy
+        )
+        
+    except Exception as e:
+        print(f"Oversegment failed: {e}, falling back to traditional CCL")
+        import cc3d
+        result = cc3d.connected_components(binary_labels, connectivity=6, out_dtype=out_dtype)
+        if return_N:
+            N = len(np.unique(result)) - 1
+            return result, N
+        else:
+            return result
+    
+    # Step 4: Split skeleton components and use segments attribute for regrouping
+    final_labels = regroup_using_segments_attribute(
+        overseg_labels, updated_skeletons, out_dtype
+    )
+    
+    # Count final components
+    unique_labels = np.unique(final_labels)
+    N = len(unique_labels) - (1 if 0 in unique_labels else 0)
     
     if return_N:
-        N = len(component_skeletons)
-        return cc_labels, N
+        return final_labels, N
     else:
-        return cc_labels
-
-def relabel_voxels_with_knn(binary_img, skeletons, out_dtype):
+        return final_labels
+    
+def regroup_using_segments_attribute(overseg_labels, updated_skeletons, out_dtype):
     """
-    KNN-based voxel relabeling method.
+    Simple and correct regrouping method:
+    1. Break each updated skeleton into individual components
+    2. For each component, comp.segments directly gives supervoxel IDs
+    3. Remap all those supervoxels to a new component ID
     """
-    labeled_img = np.zeros_like(binary_img, dtype=out_dtype)
+    result = np.zeros_like(overseg_labels, dtype=out_dtype)
+    next_component_id = 1
     
-    # Get foreground voxel coordinates
-    fg_coords = np.where(binary_img > 0)
-    fg_points = np.column_stack(fg_coords)
+    for skeleton in updated_skeletons:
+        if len(skeleton.vertices) == 0:
+            continue
+            
+        # Step 1: Break skeleton into individual components
+        components = skeleton.components()
+        
+        # Sort components deterministically
+        components = sorted(components, 
+                          key=lambda c: tuple(c.vertices[0]) if len(c.vertices) > 0 else (0,0,0))
+        
+        # Step 2: For each component, get supervoxel IDs and remap
+        for comp in components:
+            if len(comp.vertices) == 0:
+                continue
+                
+            # Step 3: comp.segments directly gives us the supervoxel IDs!
+            if hasattr(comp, 'segments') and comp.segments is not None:
+                comp_supervoxel_ids = set(comp.segments)
+                comp_supervoxel_ids.discard(0)  # Remove background
+                
+                # Remap all supervoxels in this component to the same new component ID
+                for supervoxel_id in comp_supervoxel_ids:
+                    mask = (overseg_labels == supervoxel_id)
+                    result[mask] = next_component_id
+                
+                if len(comp_supervoxel_ids) > 0:
+                    next_component_id += 1
     
-    if len(fg_points) == 0 or len(skeletons) == 0:
-        return labeled_img
-    
-    # Combine all skeleton vertices with their IDs
-    all_vertices = []
-    vertex_labels = []
-    
-    for skel in skeletons:
-        if len(skel.vertices) > 0:
-            all_vertices.append(skel.vertices)
-            vertex_labels.extend([skel.id] * len(skel.vertices))
-    
-    if len(all_vertices) == 0:
-        return labeled_img
-    
-    all_vertices = np.vstack(all_vertices)
-    vertex_labels = np.array(vertex_labels)
-    
-    # Build KNN index
-    knn = NearestNeighbors(n_neighbors=1, algorithm='auto')
-    knn.fit(all_vertices)
-    
-    # Find nearest skeleton vertex for each foreground voxel
-    distances, indices = knn.kneighbors(fg_points)
-    
-    # Assign labels
-    for i, (coord, idx) in enumerate(zip(fg_points, indices.flatten())):
-        labeled_img[tuple(coord)] = vertex_labels[idx]
-    
-    return labeled_img
+    return result
 
 @queueable
 def CCLFacesTask(
