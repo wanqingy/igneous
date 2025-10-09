@@ -39,6 +39,9 @@ from cloudvolume.lib import sip
 
 from ...types import ShapeType
 
+import kimimaro
+from sklearn.neighbors import NearestNeighbors
+
 __all__ = [
   "CCLFacesTask",
   "CCLEquivalancesTask",
@@ -123,6 +126,149 @@ def blackout_non_face_rails(
 
   return labels
 
+def skeleton_based_connected_components(labels, out_dtype=np.uint64, return_N=False):
+    """
+    Skeleton-based connected components using your proven algorithm.
+    """
+    # Convert to binary
+    if labels.dtype != np.bool_:
+        binary_labels = labels > 0
+    else:
+        binary_labels = labels.copy()
+    
+    if not np.any(binary_labels):
+        result = np.zeros_like(labels, dtype=out_dtype)
+        return (result, 0) if return_N else result
+    
+    # Step 1: Skeletonize using kimimaro
+    # Using minimal TEASAR params for basic skeletonization
+    teasar_params = {
+        'scale': 1.5,
+        'const': 300,
+        'pdrf_scale': 100000,
+        'pdrf_exponent': 4,
+        'soma_acceptance_threshold': 3500,
+        'soma_detection_threshold': 1100,
+        'soma_invalidation_scale': 1.0,
+        'soma_invalidation_const': 300
+    }
+    
+    skeletons_dict = kimimaro.skeletonize(
+        binary_labels, 
+        teasar_params,
+        dust_threshold=1000,
+        anisotropy=(1,1,1),
+        fix_branching=True,
+        fix_borders=True,
+        progress=False
+    )
+    
+    # Step 2: Process skeletons (split at branches and separate components)
+    component_skeletons = []
+    next_id = 1
+    
+    for label, skeleton in skeletons_dict.items():
+        if len(skeleton.vertices) == 0 or len(skeleton.edges) == 0:
+            continue
+            
+        # Step 2a: Split at branch points (your method)
+        branch_nodes = skeleton.branches()
+        
+        if len(branch_nodes) > 0:
+            # Create mask excluding branch nodes
+            mask = np.ones(len(skeleton.vertices), dtype=bool)
+            mask[branch_nodes] = False
+            
+            # Create mapping from old to new indices
+            old_to_new_indices = np.full(len(skeleton.vertices), -1, dtype=int)
+            old_to_new_indices[mask] = np.arange(np.sum(mask))
+            
+            # Clone and modify skeleton
+            split_skeleton = skeleton.clone()
+            split_skeleton.vertices = skeleton.vertices[mask]
+            if hasattr(skeleton, 'radius') and skeleton.radius is not None:
+                split_skeleton.radius = skeleton.radius[mask]
+            
+            # Remove edges containing branch nodes and remap
+            valid_edges_mask = ~np.isin(skeleton.edges, branch_nodes).any(axis=1)
+            if np.any(valid_edges_mask):
+                valid_edges = skeleton.edges[valid_edges_mask]
+                remapped_edges = []
+                for edge in valid_edges:
+                    new_v1 = old_to_new_indices[edge[0]]
+                    new_v2 = old_to_new_indices[edge[1]]
+                    if new_v1 >= 0 and new_v2 >= 0:
+                        remapped_edges.append([new_v1, new_v2])
+                
+                if remapped_edges:
+                    split_skeleton.edges = np.array(remapped_edges)
+                else:
+                    split_skeleton.edges = np.array([]).reshape(0, 2)
+            else:
+                split_skeleton.edges = np.array([]).reshape(0, 2)
+            
+            # Step 2b: Get components
+            components = split_skeleton.components()
+        else:
+            components = skeleton.components()
+        
+        # Step 2c: Assign unique IDs to each component
+        for comp in components:
+            if len(comp.vertices) > 1:  # Only meaningful components
+                comp.id = next_id
+                component_skeletons.append(comp)
+                next_id += 1
+    
+    # Step 3: Relabel voxels using KNN to nearest skeleton vertex
+    cc_labels = relabel_voxels_with_knn(binary_labels, component_skeletons, out_dtype)
+    
+    if return_N:
+        N = len(component_skeletons)
+        return cc_labels, N
+    else:
+        return cc_labels
+
+def relabel_voxels_with_knn(binary_img, skeletons, out_dtype):
+    """
+    KNN-based voxel relabeling method.
+    """
+    labeled_img = np.zeros_like(binary_img, dtype=out_dtype)
+    
+    # Get foreground voxel coordinates
+    fg_coords = np.where(binary_img > 0)
+    fg_points = np.column_stack(fg_coords)
+    
+    if len(fg_points) == 0 or len(skeletons) == 0:
+        return labeled_img
+    
+    # Combine all skeleton vertices with their IDs
+    all_vertices = []
+    vertex_labels = []
+    
+    for skel in skeletons:
+        if len(skel.vertices) > 0:
+            all_vertices.append(skel.vertices)
+            vertex_labels.extend([skel.id] * len(skel.vertices))
+    
+    if len(all_vertices) == 0:
+        return labeled_img
+    
+    all_vertices = np.vstack(all_vertices)
+    vertex_labels = np.array(vertex_labels)
+    
+    # Build KNN index
+    knn = NearestNeighbors(n_neighbors=1, algorithm='auto')
+    knn.fit(all_vertices)
+    
+    # Find nearest skeleton vertex for each foreground voxel
+    distances, indices = knn.kneighbors(fg_points)
+    
+    # Assign labels
+    for i, (coord, idx) in enumerate(zip(fg_points, indices.flatten())):
+        labeled_img[tuple(coord)] = vertex_labels[idx]
+    
+    return labeled_img
+
 @queueable
 def CCLFacesTask(
   cloudpath:str, mip:int, 
@@ -170,7 +316,8 @@ def CCLFacesTask(
       labels, threshold=dust_threshold, 
       connectivity=6, in_place=True
     )
-  cc_labels = cc3d.connected_components(labels, connectivity=6, out_dtype=np.uint64)
+  # cc_labels = cc3d.connected_components(labels, connectivity=6, out_dtype=np.uint64)
+  cc_labels = skeleton_based_connected_components(labels, out_dtype=np.uint64)
   cc_labels += np.uint64(label_offset)
   cc_labels[labels == 0] = 0
 
@@ -232,8 +379,12 @@ def CCLEquivalancesTask(
       labels, threshold=dust_threshold, 
       connectivity=6, in_place=True
     )
-  cc_labels, N = cc3d.connected_components(
-    labels, connectivity=6, 
+  # cc_labels, N = cc3d.connected_components(
+  #   labels, connectivity=6, 
+  #   out_dtype=np.uint64, return_N=True
+  # )
+  cc_labels, N = skeleton_based_connected_components(
+    labels,  
     out_dtype=np.uint64, return_N=True
   )
   cc_labels += np.uint64(label_offset)
@@ -336,8 +487,12 @@ def RelabelCCLTask(
       labels, threshold=dust_threshold, 
       connectivity=6, in_place=True
     )
-  cc_labels, N = cc3d.connected_components(
-    labels, connectivity=6, 
+  # cc_labels, N = cc3d.connected_components(
+  #   labels, connectivity=6, 
+  #   out_dtype=np.uint64, return_N=True
+  # )
+  cc_labels, N = skeleton_based_connected_components(
+    labels, 
     out_dtype=np.uint64, return_N=True
   )
   cc_labels += np.uint64(label_offset)
