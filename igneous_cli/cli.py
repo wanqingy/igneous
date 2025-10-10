@@ -1830,7 +1830,7 @@ void main() {
       "visible": True,
       "layer": layer_name
     },
-    "layout": "4panel"
+    "layout": "4panel-alt"
   }
 
   if pos:
