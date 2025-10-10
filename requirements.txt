@@ -6,7 +6,7 @@ connected-components-3d>=3.10.1
 dbscan
 DracoPy>=1.0.1,<2.0.0
 fastremap>=1.17.4
-fastmorph>=1.4.1
+fastmorph>=1.6.0
 google-cloud-logging
 kimimaro[accel]>=5.4.0
 mapbuffer>=0.7.1
@@ -24,5 +24,5 @@ tinybrain>=1.5.0
 task-queue>=2.4.0
 tqdm
 trimesh[easy]
-xs3d>=1.11.0
-zmesh>=1.4,<2.0
+xs3d>=1.12.2
+zmesh>=1.9.0,<2.0
