@@ -126,6 +126,167 @@ def blackout_non_face_rails(
 
   return labels
 
+def skeleton_based_connected_components(labels, out_dtype=np.uint64, return_N=False):
+    """Deterministic version of skeleton-based CCL."""
+    np.random.seed(42)
+    random.seed(42)
+    
+    # Convert to binary
+    if labels.dtype != np.bool_:
+        binary_labels = labels > 0
+    else:
+        binary_labels = labels.copy()
+    
+    if not np.any(binary_labels):
+        result = np.zeros_like(labels, dtype=out_dtype)
+        return (result, 0) if return_N else result
+    
+    # Step 1: Skeletonize with deterministic settings, need to expose more params
+    teasar_params = {
+        'scale': 4,
+        'const': 10,
+        'pdrf_scale': 100000,
+        'pdrf_exponent': 4,
+        'soma_acceptance_threshold': 3500,
+        'soma_detection_threshold': 1100,
+        'soma_invalidation_scale': 1.0,
+        'soma_invalidation_const': 300
+    }
+    
+    skeletons_dict = kimimaro.skeletonize(
+        binary_labels, 
+        teasar_params,
+        dust_threshold=0,
+        anisotropy=(1,1,1),
+        fix_branching=True,
+        fix_borders=True,
+        progress=False,
+        parallel=1  # Force single-threaded for determinism
+    )
+    
+    # Step 2: Process skeletons in DETERMINISTIC ORDER
+    component_skeletons = []
+    next_id = 1
+    
+    # Sort by label for deterministic processing
+    for label in sorted(skeletons_dict.keys()):
+        skeleton = skeletons_dict[label]
+
+        if len(skeleton.vertices) == 0 or len(skeleton.edges) == 0:
+            continue
+            
+        # Step 2a: Split at branch points (your method)
+        branch_nodes = skeleton.branches()
+        
+        if len(branch_nodes) > 0:
+            # Create mask excluding branch nodes
+            mask = np.ones(len(skeleton.vertices), dtype=bool)
+            mask[branch_nodes] = False
+            
+            # Create mapping from old to new indices
+            old_to_new_indices = np.full(len(skeleton.vertices), -1, dtype=int)
+            old_to_new_indices[mask] = np.arange(np.sum(mask))
+            
+            # Clone and modify skeleton
+            split_skeleton = skeleton.clone()
+            split_skeleton.vertices = skeleton.vertices[mask]
+            if hasattr(skeleton, 'radius') and skeleton.radius is not None:
+                split_skeleton.radius = skeleton.radius[mask]
+            
+            # Remove edges containing branch nodes and remap
+            valid_edges_mask = ~np.isin(skeleton.edges, branch_nodes).any(axis=1)
+            if np.any(valid_edges_mask):
+                valid_edges = skeleton.edges[valid_edges_mask]
+                remapped_edges = []
+                for edge in valid_edges:
+                    new_v1 = old_to_new_indices[edge[0]]
+                    new_v2 = old_to_new_indices[edge[1]]
+                    if new_v1 >= 0 and new_v2 >= 0:
+                        remapped_edges.append([new_v1, new_v2])
+                
+                if remapped_edges:
+                    split_skeleton.edges = np.array(remapped_edges)
+                else:
+                    split_skeleton.edges = np.array([]).reshape(0, 2)
+            else:
+                split_skeleton.edges = np.array([]).reshape(0, 2)
+            
+            # Step 2b: Get components
+            components = split_skeleton.components()
+        else:
+            components = skeleton.components()
+        
+        # Sort components by some deterministic criteria
+        components = sorted(components, key=lambda c: tuple(c.vertices[0]) if len(c.vertices) > 0 else (0,0,0))
+        
+        for comp in components:
+          if len(comp.vertices) > 0:
+            comp.id = next_id
+            component_skeletons.append(comp)
+            next_id += 1
+    
+    # Step 3: Deterministic voxel relabeling
+    cc_labels = relabel_voxels_deterministic(binary_labels, component_skeletons, out_dtype)
+    unique_labels = np.unique(cc_labels)
+    unique_labels = unique_labels[unique_labels != 0]  # Exclude background
+
+    # Step 4: Ensure each component is contiguous, using cc3d for final pass
+    final_labels = cc3d.connected_components(cc_labels, connectivity=6, out_dtype=out_dtype)
+    unique_labels = np.unique(final_labels)
+    unique_labels = unique_labels[unique_labels != 0]  # Exclude background
+    print(f"Final number of connected components: {len(unique_labels)}")
+
+    if return_N:
+        N = len(unique_labels)
+        return final_labels, N
+    else:
+        return final_labels
+
+def relabel_voxels_deterministic(binary_img, skeletons, out_dtype):
+    """Fully deterministic voxel relabeling."""
+    labeled_img = np.zeros_like(binary_img, dtype=out_dtype)
+    
+    fg_coords = np.where(binary_img > 0)
+    fg_points = np.column_stack(fg_coords)
+    
+    if len(fg_points) == 0 or len(skeletons) == 0:
+        return labeled_img
+    
+    # Sort skeletons by ID for deterministic processing
+    skeletons = sorted(skeletons, key=lambda s: s.id)
+    
+    # Sort vertices within each skeleton
+    all_vertices = []
+    vertex_labels = []
+    
+    for skel in skeletons:
+      if len(skel.vertices) > 0:
+        # Sort vertices by coordinates for tie-breaking consistency
+        sorted_indices = np.lexsort(skel.vertices.T)
+        sorted_vertices = skel.vertices[sorted_indices]
+          
+        all_vertices.append(sorted_vertices)
+        vertex_labels.extend([skel.id] * len(sorted_vertices))
+    
+    all_vertices = np.vstack(all_vertices)
+    vertex_labels = np.array(vertex_labels)
+    
+    # Use deterministic KNN algorithm
+    knn = NearestNeighbors(n_neighbors=1, algorithm='kd_tree')  # Fixed algorithm
+    knn.fit(all_vertices)
+    
+    distances, indices = knn.kneighbors(fg_points)
+    
+    # Process voxels in deterministic order
+    sorted_fg_indices = np.lexsort(fg_points.T)
+    
+    for i in sorted_fg_indices:
+        coord = fg_points[i]
+        idx = indices[i, 0]
+        labeled_img[tuple(coord)] = vertex_labels[idx]
+    
+    return labeled_img
+
 def skeleton_based_connected_components_with_oversegment(labels, out_dtype=np.uint64, return_N=False):
     """
     Multi-step skeleton-based CCL using oversegment segments attribute:
@@ -164,7 +325,7 @@ def skeleton_based_connected_components_with_oversegment(labels, out_dtype=np.ui
     skeletons_dict = kimimaro.skeletonize(
         binary_labels, 
         teasar_params,
-        dust_threshold=1000,
+        dust_threshold=0,
         anisotropy=(1,1,1),
         fix_branching=True,
         fix_borders=True,
