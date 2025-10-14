@@ -42,6 +42,8 @@ from ...types import ShapeType
 import kimimaro
 from sklearn.neighbors import NearestNeighbors
 
+import random
+
 __all__ = [
   "CCLFacesTask",
   "CCLEquivalancesTask",
