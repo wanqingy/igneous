@@ -128,7 +128,14 @@ def blackout_non_face_rails(
 
   return labels
 
-def skeleton_based_connected_components(labels, out_dtype=np.uint64, return_N=False):
+def skeleton_based_connected_components(
+    labels, 
+    out_dtype=np.uint64, 
+    return_N=False,
+    max_distance=None,  # ✅ Optional: None = no limit
+    teasar_scale=2,
+    teasar_const=10,
+):
     """Deterministic version of skeleton-based CCL."""
     np.random.seed(42)
     random.seed(42)
@@ -145,14 +152,15 @@ def skeleton_based_connected_components(labels, out_dtype=np.uint64, return_N=Fa
     
     # Step 1: Skeletonize with deterministic settings, need to expose more params
     teasar_params = {
-        'scale': 4,
-        'const': 10,
+        'scale': teasar_scale,
+        'const': teasar_const,
         'pdrf_scale': 100000,
         'pdrf_exponent': 4,
         'soma_acceptance_threshold': 3500,
         'soma_detection_threshold': 1100,
         'soma_invalidation_scale': 1.0,
-        'soma_invalidation_const': 300
+        'soma_invalidation_const': 300,
+        'max_paths': None,
     }
     
     skeletons_dict = kimimaro.skeletonize(
@@ -218,7 +226,7 @@ def skeleton_based_connected_components(labels, out_dtype=np.uint64, return_N=Fa
         else:
             components = skeleton.components()
         
-        # Sort components by some deterministic criteria
+        # Sort components
         components = sorted(components, key=lambda c: tuple(c.vertices[0]) if len(c.vertices) > 0 else (0,0,0))
         
         for comp in components:
@@ -228,7 +236,12 @@ def skeleton_based_connected_components(labels, out_dtype=np.uint64, return_N=Fa
             next_id += 1
     
     # Step 3: Deterministic voxel relabeling
-    cc_labels = relabel_voxels_deterministic(binary_labels, component_skeletons, out_dtype)
+    cc_labels = relabel_voxels_deterministic(
+        binary_labels, 
+        component_skeletons, 
+        out_dtype,
+        max_distance=max_distance
+    )
     unique_labels = np.unique(cc_labels)
     unique_labels = unique_labels[unique_labels != 0]  # Exclude background
 
@@ -244,7 +257,8 @@ def skeleton_based_connected_components(labels, out_dtype=np.uint64, return_N=Fa
     else:
         return final_labels
 
-def relabel_voxels_deterministic(binary_img, skeletons, out_dtype):
+## to do: max_distance according to radius
+def relabel_voxels_deterministic(binary_img, skeletons, out_dtype, max_distance=None):
     """Fully deterministic voxel relabeling."""
     labeled_img = np.zeros_like(binary_img, dtype=out_dtype)
     
@@ -278,10 +292,15 @@ def relabel_voxels_deterministic(binary_img, skeletons, out_dtype):
     knn.fit(all_vertices)
     
     distances, indices = knn.kneighbors(fg_points)
-    
+
     # Process voxels in deterministic order
     sorted_fg_indices = np.lexsort(fg_points.T)
     
+    if max_distance is not None:
+          # Apply distance threshold if specified
+          valid_mask = distances.flatten() <= max_distance
+          sorted_fg_indices = sorted_fg_indices[valid_mask[sorted_fg_indices]]
+      
     for i in sorted_fg_indices:
         coord = fg_points[i]
         idx = indices[i, 0]
