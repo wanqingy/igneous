@@ -163,77 +163,17 @@ def skeleton_based_connected_components(
         'max_paths': None,
     }
     
-    skeletons_dict = kimimaro.skeletonize(
-        binary_labels, 
-        teasar_params,
-        dust_threshold=0,
-        anisotropy=(1,1,1),
-        fix_branching=True,
-        fix_borders=True,
-        progress=False,
-        parallel=1  # Force single-threaded for determinism
-    )
+    # Step 1: Skeletonize
+    skeletons_dict = skeletonize_image(binary_labels, teasar_params)
+    if not skeletons_dict:
+        result = np.zeros_like(binary_labels, dtype=out_dtype)
+        return (result, 0) if return_N else result
     
-    # Step 2: Process skeletons in DETERMINISTIC ORDER
-    component_skeletons = []
-    next_id = 1
-    
-    # Sort by label for deterministic processing
-    for label in sorted(skeletons_dict.keys()):
-        skeleton = skeletons_dict[label]
+    # Step 2a: Remove branch nodes
+    branch_removed_skeletons = remove_branch_nodes(skeletons_dict)
 
-        if len(skeleton.vertices) == 0 or len(skeleton.edges) == 0:
-            continue
-            
-        # Step 2a: Split at branch points (your method)
-        branch_nodes = skeleton.branches()
-        
-        if len(branch_nodes) > 0:
-            # Create mask excluding branch nodes
-            mask = np.ones(len(skeleton.vertices), dtype=bool)
-            mask[branch_nodes] = False
-            
-            # Create mapping from old to new indices
-            old_to_new_indices = np.full(len(skeleton.vertices), -1, dtype=int)
-            old_to_new_indices[mask] = np.arange(np.sum(mask))
-            
-            # Clone and modify skeleton
-            split_skeleton = skeleton.clone()
-            split_skeleton.vertices = skeleton.vertices[mask]
-            if hasattr(skeleton, 'radius') and skeleton.radius is not None:
-                split_skeleton.radius = skeleton.radius[mask]
-            
-            # Remove edges containing branch nodes and remap
-            valid_edges_mask = ~np.isin(skeleton.edges, branch_nodes).any(axis=1)
-            if np.any(valid_edges_mask):
-                valid_edges = skeleton.edges[valid_edges_mask]
-                remapped_edges = []
-                for edge in valid_edges:
-                    new_v1 = old_to_new_indices[edge[0]]
-                    new_v2 = old_to_new_indices[edge[1]]
-                    if new_v1 >= 0 and new_v2 >= 0:
-                        remapped_edges.append([new_v1, new_v2])
-                
-                if remapped_edges:
-                    split_skeleton.edges = np.array(remapped_edges)
-                else:
-                    split_skeleton.edges = np.array([]).reshape(0, 2)
-            else:
-                split_skeleton.edges = np.array([]).reshape(0, 2)
-            
-            # Step 2b: Get components
-            components = split_skeleton.components()
-        else:
-            components = skeleton.components()
-        
-        # Sort components
-        components = sorted(components, key=lambda c: tuple(c.vertices[0]) if len(c.vertices) > 0 else (0,0,0))
-        
-        for comp in components:
-          if len(comp.vertices) > 0:
-            comp.id = next_id
-            component_skeletons.append(comp)
-            next_id += 1
+    # Step 2b: Separate into components and assign IDs
+    component_skeletons = separate_skeleton_components(branch_removed_skeletons)
     
     # Step 3: Deterministic voxel relabeling
     cc_labels = relabel_voxels_deterministic(
@@ -245,10 +185,8 @@ def skeleton_based_connected_components(
     unique_labels = np.unique(cc_labels)
     unique_labels = unique_labels[unique_labels != 0]  # Exclude background
 
-    # Step 4: Ensure each component is contiguous, using cc3d for final pass
-    final_labels = cc3d.connected_components(cc_labels, connectivity=6, out_dtype=out_dtype)
-    unique_labels = np.unique(final_labels)
-    unique_labels = unique_labels[unique_labels != 0]  # Exclude background
+    # Step 4: Ensure each component is contiguous, using modular helper
+    final_labels, N = make_components_contiguous(cc_labels, out_dtype)
     print(f"Final number of connected components: {len(unique_labels)}")
 
     if return_N:
@@ -308,7 +246,96 @@ def relabel_voxels_deterministic(binary_img, skeletons, out_dtype, max_distance=
     
     return labeled_img
 
-def skeleton_based_connected_components_with_oversegment(labels, out_dtype=np.uint64, return_N=False, teasar_scale=2, teasar_const=10):
+def skeletonize_image(binary_labels, teasar_params):
+    """Step 1: Skeletonize with deterministic settings."""
+    return kimimaro.skeletonize(
+        binary_labels, 
+        teasar_params,
+        dust_threshold=0,
+        anisotropy=(1,1,1),
+        fix_branching=True,
+        fix_borders=True,
+        progress=False,
+        parallel=1
+    )
+
+def remove_branch_nodes(skeletons_dict):
+    """Step 2: Remove branch nodes from skeletons."""
+    branch_removed_skeletons = []
+    for label in sorted(skeletons_dict.keys()):
+        skeleton = skeletons_dict[label]
+        if len(skeleton.vertices) == 0 or len(skeleton.edges) == 0:
+            continue
+        branch_nodes = skeleton.branches()
+        if len(branch_nodes) > 0:
+            mask = np.ones(len(skeleton.vertices), dtype=bool)
+            mask[branch_nodes] = False
+            old_to_new_indices = np.full(len(skeleton.vertices), -1, dtype=int)
+            old_to_new_indices[mask] = np.arange(np.sum(mask))
+            split_skeleton = skeleton.clone()
+            split_skeleton.vertices = skeleton.vertices[mask]
+            if hasattr(skeleton, 'radius') and skeleton.radius is not None:
+                split_skeleton.radius = skeleton.radius[mask]
+            valid_edges_mask = ~np.isin(skeleton.edges, branch_nodes).any(axis=1)
+            if np.any(valid_edges_mask):
+                valid_edges = skeleton.edges[valid_edges_mask]
+                remapped_edges = []
+                for edge in valid_edges:
+                    new_v1 = old_to_new_indices[edge[0]]
+                    new_v2 = old_to_new_indices[edge[1]]
+                    if new_v1 >= 0 and new_v2 >= 0:
+                        remapped_edges.append([new_v1, new_v2])
+                split_skeleton.edges = np.array(remapped_edges) if remapped_edges else np.array([]).reshape(0, 2)
+            else:
+                split_skeleton.edges = np.array([]).reshape(0, 2)
+            split_skeleton.id = label
+            branch_removed_skeletons.append(split_skeleton)
+        else:
+            skeleton.id = label
+            branch_removed_skeletons.append(skeleton)
+    return branch_removed_skeletons
+
+def separate_skeleton_components(branch_removed_skeletons):
+    """Separate each skeleton into components and assign IDs."""
+    component_skeletons = []
+    next_id = 1
+    for skeleton in branch_removed_skeletons:
+        components = skeleton.components()
+        components = sorted(components, key=lambda c: tuple(c.vertices[0]) if len(c.vertices) > 0 else (0,0,0))
+        for comp in components:
+            if len(comp.vertices) > 0:
+                comp.id = next_id
+                component_skeletons.append(comp)
+                next_id += 1
+    return component_skeletons
+
+def oversegment_image(labels, branch_removed_skeletons, downsample=4):
+    """Step 3: Use branch-removed skeletons for oversegmentation."""
+    return kimimaro.oversegment(
+        labels,
+        branch_removed_skeletons,
+        anisotropy=(1,1,1),
+        progress=False,
+        fill_holes=False,
+        in_place=False,
+        downsample=downsample,
+    )
+
+def relabel_components(overseg_labels, updated_skeletons, out_dtype):
+    """Step 4: Split skeleton components and use segments attribute for regrouping."""
+    return regroup_using_segments_attribute(overseg_labels, updated_skeletons, out_dtype)
+
+def make_components_contiguous(labels, out_dtype):
+    """Ensure each component is contiguous using cc3d."""
+    final_labels = cc3d.connected_components(labels, connectivity=6, out_dtype=out_dtype)
+    unique_labels = np.unique(final_labels)
+    unique_labels = unique_labels[unique_labels != 0]  # Exclude background
+    print(f"Final number of connected components: {len(unique_labels)}")
+    return final_labels, len(unique_labels)
+
+def skeleton_based_connected_components_with_oversegment(
+    labels, out_dtype=np.uint64, return_N=False, teasar_scale=2, teasar_const=10, downsample=4
+):
     """
     Multi-step skeleton-based CCL using oversegment segments attribute:
     1. Skeletonize
@@ -316,22 +343,13 @@ def skeleton_based_connected_components_with_oversegment(labels, out_dtype=np.ui
     3. Use branch-removed skeletons for oversegment to create supervoxels
     4. Split skeleton components and use segments attribute for accurate regrouping
     """
-    
-    # Set seeds for determinism
     np.random.seed(42)
     random.seed(42)
-    
-    # Convert to binary
-    if labels.dtype != np.bool_:
-        binary_labels = labels > 0
-    else:
-        binary_labels = labels.copy()
-    
+    binary_labels = labels > 0 if labels.dtype != np.bool_ else labels.copy()
     if not np.any(binary_labels):
         result = np.zeros_like(labels, dtype=out_dtype)
         return (result, 0) if return_N else result
-    
-    # Step 1: Skeletonize with deterministic settings
+
     teasar_params = {
         'scale': teasar_scale,
         'const': teasar_const,
@@ -342,87 +360,23 @@ def skeleton_based_connected_components_with_oversegment(labels, out_dtype=np.ui
         'soma_invalidation_scale': 1.0,
         'soma_invalidation_const': 300
     }
-    
-    skeletons_dict = kimimaro.skeletonize(
-        binary_labels, 
-        teasar_params,
-        dust_threshold=0,
-        anisotropy=(1,1,1),
-        fix_branching=True,
-        fix_borders=True,
-        progress=False,
-        parallel=1  # Force single-threaded for determinism
-    )
-    
+
+    skeletons_dict = skeletonize_image(binary_labels, teasar_params)
     if not skeletons_dict:
         result = np.zeros_like(binary_labels, dtype=out_dtype)
         return (result, 0) if return_N else result
-    
-    # Step 2: Remove branch nodes from skeletons
-    branch_removed_skeletons = []
-    
-    for label in sorted(skeletons_dict.keys()):
-        skeleton = skeletons_dict[label]
-        
-        if len(skeleton.vertices) == 0 or len(skeleton.edges) == 0:
-            continue
-            
-        # Remove branch nodes
-        branch_nodes = skeleton.branches()
-        
-        if len(branch_nodes) > 0:
-            # Create mask excluding branch nodes
-            mask = np.ones(len(skeleton.vertices), dtype=bool)
-            mask[branch_nodes] = False
-            
-            # Create mapping from old to new indices
-            old_to_new_indices = np.full(len(skeleton.vertices), -1, dtype=int)
-            old_to_new_indices[mask] = np.arange(np.sum(mask))
-            
-            # Clone and modify skeleton
-            split_skeleton = skeleton.clone()
-            split_skeleton.vertices = skeleton.vertices[mask]
-            if hasattr(skeleton, 'radius') and skeleton.radius is not None:
-                split_skeleton.radius = skeleton.radius[mask]
-            
-            # Remove edges containing branch nodes and remap
-            valid_edges_mask = ~np.isin(skeleton.edges, branch_nodes).any(axis=1)
-            if np.any(valid_edges_mask):
-                valid_edges = skeleton.edges[valid_edges_mask]
-                remapped_edges = []
-                for edge in valid_edges:
-                    new_v1 = old_to_new_indices[edge[0]]
-                    new_v2 = old_to_new_indices[edge[1]]
-                    if new_v1 >= 0 and new_v2 >= 0:
-                        remapped_edges.append([new_v1, new_v2])
-                
-                if remapped_edges:
-                    split_skeleton.edges = np.array(remapped_edges)
-                else:
-                    split_skeleton.edges = np.array([]).reshape(0, 2)
-            else:
-                split_skeleton.edges = np.array([]).reshape(0, 2)
-            
-            # Assign temporary ID for oversegment
-            split_skeleton.id = label
-            branch_removed_skeletons.append(split_skeleton)
-        else:
-            # No branch points, keep original skeleton
-            skeleton.id = label
-            branch_removed_skeletons.append(skeleton)
-    
-    # Step 3: Use branch-removed skeletons for oversegmentation
+
+    branch_removed_skeletons = remove_branch_nodes(skeletons_dict)
     try:
-        overseg_labels, updated_skeletons = kimimaro.oversegment(
-            labels,
-            branch_removed_skeletons,
-            anisotropy=(1,1,1),
-            progress=False,
-            fill_holes=False,
-            in_place=False,
-            downsample=4,
-        )
-        
+        overseg_labels, updated_skeletons = oversegment_image(labels, branch_removed_skeletons, downsample=downsample)
+        # --- LOGGING MISSED FOREGROUND VOXELS ---
+        missed_mask = (binary_labels > 0) & (overseg_labels == 0)
+        missed_count = np.count_nonzero(missed_mask)
+        if missed_count > 0:
+            print(f"[Oversegmentation] Missed foreground voxels: {missed_count}")
+            missed_coords = np.column_stack(np.where(missed_mask))
+            print(f"Example missed voxel coordinates: {missed_coords[:5]}")
+        # --- END LOGGING ---
     except Exception as e:
         print(f"Oversegment failed: {e}, falling back to traditional CCL")
         result = cc3d.connected_components(binary_labels, connectivity=6, out_dtype=out_dtype)
@@ -431,20 +385,11 @@ def skeleton_based_connected_components_with_oversegment(labels, out_dtype=np.ui
             return result, N
         else:
             return result
-    
-    # Step 4: Split skeleton components and use segments attribute for regrouping
-    cc_labels = regroup_using_segments_attribute(
-        overseg_labels, updated_skeletons, out_dtype
-    )
 
-    # Step 5: Ensure each component is contiguous, using cc3d for final pass
-    final_labels = cc3d.connected_components(cc_labels, connectivity=6, out_dtype=out_dtype)
-    unique_labels = np.unique(final_labels)
-    unique_labels = unique_labels[unique_labels != 0]  # Exclude background
-    print(f"Final number of connected components: {len(unique_labels)}")
-    
+    cc_labels = relabel_components(overseg_labels, updated_skeletons, out_dtype)
+    final_labels, N = make_components_contiguous(cc_labels, out_dtype)
+
     if return_N:
-        N = len(unique_labels)
         return final_labels, N
     else:
         return final_labels
@@ -822,8 +767,3 @@ def clean_intermediate_files(src, mip):
   cv = CloudVolume(src, mip)
   cf = CloudFiles(src)
   cf.delete(cf.list(cf.join(cv.key, "ccl")))
-
-
-
-
-
