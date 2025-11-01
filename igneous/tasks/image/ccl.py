@@ -132,7 +132,7 @@ def skeleton_based_connected_components(
     labels, 
     out_dtype=np.uint64, 
     return_N=False,
-    max_distance=None,  # ✅ Optional: None = no limit
+    max_distance=None,  # Optional: None = no limit
     teasar_scale=2,
     teasar_const=10,
 ):
@@ -308,7 +308,7 @@ def relabel_voxels_deterministic(binary_img, skeletons, out_dtype, max_distance=
     
     return labeled_img
 
-def skeleton_based_connected_components_with_oversegment(labels, out_dtype=np.uint64, return_N=False):
+def skeleton_based_connected_components_with_oversegment(labels, out_dtype=np.uint64, return_N=False, teasar_scale=2, teasar_const=10):
     """
     Multi-step skeleton-based CCL using oversegment segments attribute:
     1. Skeletonize
@@ -333,8 +333,8 @@ def skeleton_based_connected_components_with_oversegment(labels, out_dtype=np.ui
     
     # Step 1: Skeletonize with deterministic settings
     teasar_params = {
-        'scale': 4,
-        'const': 10,
+        'scale': teasar_scale,
+        'const': teasar_const,
         'pdrf_scale': 100000,
         'pdrf_exponent': 4,
         'soma_acceptance_threshold': 3500,
@@ -355,7 +355,7 @@ def skeleton_based_connected_components_with_oversegment(labels, out_dtype=np.ui
     )
     
     if not skeletons_dict:
-        result = np.zeros_like(labels, dtype=out_dtype)
+        result = np.zeros_like(binary_labels, dtype=out_dtype)
         return (result, 0) if return_N else result
     
     # Step 2: Remove branch nodes from skeletons
@@ -414,18 +414,17 @@ def skeleton_based_connected_components_with_oversegment(labels, out_dtype=np.ui
     # Step 3: Use branch-removed skeletons for oversegmentation
     try:
         overseg_labels, updated_skeletons = kimimaro.oversegment(
-            binary_labels,
+            labels,
             branch_removed_skeletons,
             anisotropy=(1,1,1),
             progress=False,
             fill_holes=False,
             in_place=False,
-            downsample=0  # No downsampling for accuracy
+            downsample=4,
         )
         
     except Exception as e:
         print(f"Oversegment failed: {e}, falling back to traditional CCL")
-        import cc3d
         result = cc3d.connected_components(binary_labels, connectivity=6, out_dtype=out_dtype)
         if return_N:
             N = len(np.unique(result)) - 1
@@ -434,15 +433,18 @@ def skeleton_based_connected_components_with_oversegment(labels, out_dtype=np.ui
             return result
     
     # Step 4: Split skeleton components and use segments attribute for regrouping
-    final_labels = regroup_using_segments_attribute(
+    cc_labels = regroup_using_segments_attribute(
         overseg_labels, updated_skeletons, out_dtype
     )
-    
-    # Count final components
+
+    # Step 5: Ensure each component is contiguous, using cc3d for final pass
+    final_labels = cc3d.connected_components(cc_labels, connectivity=6, out_dtype=out_dtype)
     unique_labels = np.unique(final_labels)
-    N = len(unique_labels) - (1 if 0 in unique_labels else 0)
+    unique_labels = unique_labels[unique_labels != 0]  # Exclude background
+    print(f"Final number of connected components: {len(unique_labels)}")
     
     if return_N:
+        N = len(unique_labels)
         return final_labels, N
     else:
         return final_labels
@@ -456,6 +458,7 @@ def regroup_using_segments_attribute(overseg_labels, updated_skeletons, out_dtyp
     """
     result = np.zeros_like(overseg_labels, dtype=out_dtype)
     next_component_id = 1
+    supervoxel_to_component = {}
     
     for skeleton in updated_skeletons:
         if len(skeleton.vertices) == 0:
@@ -475,16 +478,24 @@ def regroup_using_segments_attribute(overseg_labels, updated_skeletons, out_dtyp
                 
             # Step 3: comp.segments directly gives us the supervoxel IDs!
             if hasattr(comp, 'segments') and comp.segments is not None:
-                comp_supervoxel_ids = set(comp.segments)
-                comp_supervoxel_ids.discard(0)  # Remove background
+                # comp_supervoxel_ids = set(comp.segments)
+                # comp_supervoxel_ids.discard(0)  # Remove background
                 
                 # Remap all supervoxels in this component to the same new component ID
-                for supervoxel_id in comp_supervoxel_ids:
-                    mask = (overseg_labels == supervoxel_id)
-                    result[mask] = next_component_id
+                # for supervoxel_id in comp_supervoxel_ids:
+                #     mask = (overseg_labels == supervoxel_id)
+                #     result[mask] = next_component_id
                 
-                if len(comp_supervoxel_ids) > 0:
-                    next_component_id += 1
+                # if len(comp_supervoxel_ids) > 0:
+                #     next_component_id += 1
+                for supervoxel_id in set(comp.segments):
+                  supervoxel_to_component[supervoxel_id] = next_component_id
+                if len(set(comp.segments)) > 0:
+                  next_component_id += 1
+
+    # Use fastremap for efficient mapping
+    result = fastremap.remap(overseg_labels, supervoxel_to_component, in_place=False, preserve_missing_labels=True)
+    result = result.astype(out_dtype)
     
     return result
 
@@ -536,7 +547,9 @@ def CCLFacesTask(
       connectivity=6, in_place=True
     )
   # cc_labels = cc3d.connected_components(labels, connectivity=6, out_dtype=np.uint64)
-  cc_labels = skeleton_based_connected_components(labels, out_dtype=np.uint64)
+  # cc_labels = skeleton_based_connected_components(labels, out_dtype=np.uint64)
+  cc_labels = skeleton_based_connected_components_with_oversegment(labels, out_dtype=np.uint64)
+  labels = cc_labels.copy()
   cc_labels += np.uint64(label_offset)
   cc_labels[labels == 0] = 0
 
@@ -602,10 +615,16 @@ def CCLEquivalancesTask(
   #   labels, connectivity=6, 
   #   out_dtype=np.uint64, return_N=True
   # )
-  cc_labels, N = skeleton_based_connected_components(
-    labels,  
-    out_dtype=np.uint64, return_N=True
+  # cc_labels, N = skeleton_based_connected_components(
+  #   labels,  
+  #   out_dtype=np.uint64, return_N=True
+  # )
+  cc_labels, N = skeleton_based_connected_components_with_oversegment(
+     labels, 
+     out_dtype=np.uint64,
+     return_N=True
   )
+  labels = cc_labels.copy()
   cc_labels += np.uint64(label_offset)
   cc_labels[labels == 0] = 0
 
@@ -710,10 +729,16 @@ def RelabelCCLTask(
   #   labels, connectivity=6, 
   #   out_dtype=np.uint64, return_N=True
   # )
-  cc_labels, N = skeleton_based_connected_components(
-    labels, 
-    out_dtype=np.uint64, return_N=True
+  # cc_labels, N = skeleton_based_connected_components(
+  #   labels, 
+  #   out_dtype=np.uint64, return_N=True
+  # )
+  cc_labels, N = skeleton_based_connected_components_with_oversegment(
+     labels, 
+     out_dtype=np.uint64,
+     return_N=True
   )
+  labels = cc_labels.copy()
   cc_labels += np.uint64(label_offset)
   cc_labels[labels == 0] = 0
 
