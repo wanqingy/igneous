@@ -170,7 +170,7 @@ def skeleton_based_connected_components(
         return (result, 0) if return_N else result
     
     # Step 2a: Remove branch nodes
-    branch_removed_skeletons = remove_branch_nodes(skeletons_dict)
+    branch_removed_skeletons = split_at_branch_nodes(skeletons_dict)
 
     # Step 2b: Separate into components and assign IDs
     component_skeletons = separate_skeleton_components(branch_removed_skeletons)
@@ -259,40 +259,52 @@ def skeletonize_image(binary_labels, teasar_params):
         parallel=1
     )
 
-def remove_branch_nodes(skeletons_dict):
-    """Step 2: Remove branch nodes from skeletons."""
+def split_at_branch_nodes(skeletons_dict, preserve_branch_nodes=True):
+    """
+    Remove branch nodes from skeletons.
+    If preserve_branch_nodes is True, only remove edges containing branch nodes,
+    but keep branch node vertices.
+    If False, remove both branch node vertices and their edges.
+    """
     branch_removed_skeletons = []
     for label in sorted(skeletons_dict.keys()):
         skeleton = skeletons_dict[label]
         if len(skeleton.vertices) == 0 or len(skeleton.edges) == 0:
             continue
+        
         branch_nodes = skeleton.branches()
+        split_skeleton = skeleton.clone()
+        
         if len(branch_nodes) > 0:
-            mask = np.ones(len(skeleton.vertices), dtype=bool)
-            mask[branch_nodes] = False
-            old_to_new_indices = np.full(len(skeleton.vertices), -1, dtype=int)
-            old_to_new_indices[mask] = np.arange(np.sum(mask))
-            split_skeleton = skeleton.clone()
-            split_skeleton.vertices = skeleton.vertices[mask]
-            if hasattr(skeleton, 'radius') and skeleton.radius is not None:
-                split_skeleton.radius = skeleton.radius[mask]
-            valid_edges_mask = ~np.isin(skeleton.edges, branch_nodes).any(axis=1)
-            if np.any(valid_edges_mask):
-                valid_edges = skeleton.edges[valid_edges_mask]
-                remapped_edges = []
-                for edge in valid_edges:
-                    new_v1 = old_to_new_indices[edge[0]]
-                    new_v2 = old_to_new_indices[edge[1]]
-                    if new_v1 >= 0 and new_v2 >= 0:
-                        remapped_edges.append([new_v1, new_v2])
-                split_skeleton.edges = np.array(remapped_edges) if remapped_edges else np.array([]).reshape(0, 2)
+            if preserve_branch_nodes:
+                # Remove edges containing any branch node, keep all vertices
+                valid_edges_mask = ~np.isin(split_skeleton.edges, branch_nodes).any(axis=1)
+                split_skeleton.edges = split_skeleton.edges[valid_edges_mask]
+                # Vertices and radius remain unchanged
             else:
-                split_skeleton.edges = np.array([]).reshape(0, 2)
+                # Remove branch node vertices and any edges containing them
+                mask = np.ones(len(split_skeleton.vertices), dtype=bool)
+                mask[branch_nodes] = False
+                old_to_new_indices = np.full(len(split_skeleton.vertices), -1, dtype=int)
+                old_to_new_indices[mask] = np.arange(np.sum(mask))
+                
+                split_skeleton.vertices = split_skeleton.vertices[mask]
+                if hasattr(split_skeleton, 'radius') and split_skeleton.radius is not None:
+                    split_skeleton.radius = split_skeleton.radius[mask]
+                
+                # Filter and remap edges in one step
+                valid_edges_mask = ~np.isin(split_skeleton.edges, branch_nodes).any(axis=1)
+                if np.any(valid_edges_mask):
+                    split_skeleton.edges = old_to_new_indices[split_skeleton.edges[valid_edges_mask]]
+                else:
+                    split_skeleton.edges = np.array([]).reshape(0, 2)
+            
             split_skeleton.id = label
             branch_removed_skeletons.append(split_skeleton)
         else:
-            skeleton.id = label
-            branch_removed_skeletons.append(skeleton)
+            split_skeleton.id = label
+            branch_removed_skeletons.append(split_skeleton)
+    
     return branch_removed_skeletons
 
 def separate_skeleton_components(branch_removed_skeletons):
@@ -346,6 +358,7 @@ def skeleton_based_connected_components_with_oversegment(
     np.random.seed(42)
     random.seed(42)
     binary_labels = labels > 0 if labels.dtype != np.bool_ else labels.copy()
+    
     if not np.any(binary_labels):
         result = np.zeros_like(labels, dtype=out_dtype)
         return (result, 0) if return_N else result
@@ -366,9 +379,9 @@ def skeleton_based_connected_components_with_oversegment(
         result = np.zeros_like(binary_labels, dtype=out_dtype)
         return (result, 0) if return_N else result
 
-    branch_removed_skeletons = remove_branch_nodes(skeletons_dict)
+    branch_removed_skeletons = split_at_branch_nodes(skeletons_dict)
     try:
-        overseg_labels, updated_skeletons = oversegment_image(labels, branch_removed_skeletons, downsample=downsample)
+        overseg_labels, updated_skeletons = oversegment_image(labels.astype(np.uint8), branch_removed_skeletons, downsample=downsample)
         # --- LOGGING MISSED FOREGROUND VOXELS ---
         missed_mask = (binary_labels > 0) & (overseg_labels == 0)
         missed_count = np.count_nonzero(missed_mask)
