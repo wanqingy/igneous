@@ -83,6 +83,7 @@ class SkeletonTask(RegisteredTask):
     cross_sectional_area_smoothing_window:int = 1,
     cross_sectional_area_shape_delta:int = 150,
     cross_sectional_area_repair_sec_per_label:int = 0, # default disabled
+    cross_sectional_area_low_memory_threshold:int = int(8e9),
     dry_run:bool = False,
     strip_integer_attributes:bool = True,
     fix_autapses:bool = False,
@@ -98,8 +99,11 @@ class SkeletonTask(RegisteredTask):
       dust_threshold, progress, parallel,
       fill_missing, bool(sharded), frag_path, bool(spatial_index),
       spatial_grid_shape, synapses, bool(dust_global),
-      bool(cross_sectional_area), int(cross_sectional_area_smoothing_window),
-      int(cross_sectional_area_shape_delta), int(cross_sectional_area_repair_sec_per_label),
+      bool(cross_sectional_area), 
+      int(cross_sectional_area_smoothing_window),
+      int(cross_sectional_area_shape_delta), 
+      int(cross_sectional_area_repair_sec_per_label),
+      int(cross_sectional_area_low_memory_threshold),
       bool(dry_run), bool(strip_integer_attributes),
       bool(fix_autapses), timestamp,
       root_ids_cloudpath,
@@ -108,10 +112,6 @@ class SkeletonTask(RegisteredTask):
       self.frag_path = cloudfiles.paths.normalize(self.frag_path)
     self.bounds = Bbox(offset, Vec(*shape) + Vec(*offset))
     self.index_bounds = Bbox(offset, Vec(*spatial_grid_shape) + Vec(*offset))
-
-    # aggressive morphological hole filling has a 1-2vx 
-    # edge effect that needs to be cropped away
-    self.hole_filling_padding = (self.fill_holes >= 3) * 2
 
   def execute(self):
     # For graphene volumes, if we've materialized the root IDs
@@ -124,7 +124,7 @@ class SkeletonTask(RegisteredTask):
     lru_bytes = 0
     lru_encoding = 'same'
 
-    if self.cross_sectional_area:
+    if self.cross_sectional_area and (self.cross_sectional_area_repair_sec_per_label > 0 or self.parallel == 1):
       lru_bytes = self.bounds.size() + 2 * self.cross_sectional_area_shape_delta
       lru_bytes = int(lru_bytes[0]) * int(lru_bytes[1]) * int(lru_bytes[2]) * 8 // 50
       lru_encoding = 'crackle'
@@ -132,7 +132,7 @@ class SkeletonTask(RegisteredTask):
     vol = CloudVolume(
       cloudpath,
       mip=self.mip,
-      bounded=(self.hole_filling_padding == 0),
+      bounded=True,
       info=self.info,
       cdn_cache=False,
       parallel=self.parallel,
@@ -142,9 +142,6 @@ class SkeletonTask(RegisteredTask):
     )
     bbox = Bbox.clamp(self.bounds, vol.bounds)
     index_bbox = Bbox.clamp(self.index_bounds, vol.bounds)
-
-    bbox.minpt -= self.hole_filling_padding
-    bbox.maxpt += self.hole_filling_padding
 
     path = vol.info.get("skeletons", "skeletons")
     if self.frag_path is None:
@@ -220,7 +217,13 @@ class SkeletonTask(RegisteredTask):
       skel.id = sid
 
     if self.cross_sectional_area: # This is expensive!
-      skeletons = self.compute_cross_sectional_area(vol, bbox, skeletons)
+      if self.should_use_low_memory(bbox):
+        skeletons = self.compute_cross_sectional_area_low_mem(vol, bbox, skeletons)
+      else:
+        skeletons = self.compute_cross_sectional_area(vol, bbox, skeletons)
+
+      if self.cross_sectional_area_repair_sec_per_label != 0:
+        skeletons = self.repair_cross_sectional_area_contacts(vol, bbox, skeletons)
 
     # voxel centered (+0.5) and uses more accurate bounding box from mip 0
     corrected_offset = (bbox.minpt.astype(np.float32) - vol.meta.voxel_offset(self.mip) + 0.5) * vol.meta.resolution(self.mip)
@@ -255,42 +258,47 @@ class SkeletonTask(RegisteredTask):
     if self.spatial_index:
       self.upload_spatial_index(vol, path, index_bbox, skeletons)
 
-  def _compute_fill_holes(self, all_labels):
-    filled_labels, hole_labels_set = fastmorph.fill_holes(
-      all_labels,
-      remove_enclosed=True,
-      return_removed=True,
-      fix_borders=(self.fill_holes >= 2),
-      morphological_closing=(self.fill_holes >= 3),
-      progress=self.progress,
-    )
+  def should_use_low_memory(self, bbox:Bbox) -> bool:
+      bigger_bbx = bbox.clone()
+      bigger_bbx.grow(self.cross_sectional_area_shape_delta)
+      # Factor of 6 is based on observed behavior on 2025-10-06
+      # with delta +250 
+      return bigger_bbx.volume() * 6 > self.cross_sectional_area_low_memory_threshold
 
-    if self.fill_holes >= 3:
-      hp = self.hole_filling_padding
-      all_labels = np.asfortranarray(all_labels[hp:-hp,hp:-hp,hp:-hp])
-      filled_labels = np.asfortranarray(filled_labels[hp:-hp,hp:-hp,hp:-hp])
-
-    return (filled_labels, hole_labels_set)
-
-  def _do_operation(self, all_labels, fn):
+  def _do_operation(self, vol, all_labels, fn):
     if callable(all_labels):
       all_labels = all_labels()
 
-    if self.fill_holes > 0:
-      filled_labels, hole_labels = self._compute_fill_holes(all_labels)
-      all_labels = crackle.compress(all_labels)
-      skeletons = fn(filled_labels)
-      del filled_labels
+    if self.fill_holes == 0:
+      return (fn(all_labels), {})
 
-      all_labels = crackle.decompress(all_labels)
-      hole_labels = fastremap.mask_except(all_labels, list(hole_labels), in_place=True)
-      del all_labels
-      hole_skeletons = fn(hole_labels)
-      skeletons.update(hole_skeletons)
-    else:
-      skeletons = fn(all_labels)
+    if self.fill_holes >= 3:
+      all_labels = fastmorph.dilate(
+        all_labels, 
+        mode=fastmorph.Mode.multilabel,
+        background_only=True,
+        parallel=self.parallel,
+      )
 
-    return skeletons
+    merge_threshold=(
+      1.0 if self.fill_holes <= 3 else (1.0 - 0.01 * (self.fill_holes - 3))
+    )
+
+    filled_labels, hole_labels = fastmorph.fill_holes_v2(
+      all_labels,
+      fix_borders=(self.fill_holes >= 2),
+      merge_threshold=merge_threshold,
+      anisotropy=vol.resolution,
+      parallel=self.parallel,
+      return_crackle=True,
+    )
+    del all_labels
+
+    skeletons = fn(filled_labels.numpy())
+    del filled_labels
+    hole_skeletons = fn(hole_labels.numpy())
+    
+    return (skeletons, hole_skeletons)
 
   def skeletonize(
     self, 
@@ -316,7 +324,15 @@ class SkeletonTask(RegisteredTask):
         voxel_graph=voxel_graph,
       )
 
-    return self._do_operation(all_labels, do_skeletonize)
+    skeletons, hole_skeletons = self._do_operation(vol, all_labels, do_skeletonize)
+
+    for segid, hole_skel in hole_skeletons.items():
+      if segid in skeletons:
+        skeletons[segid] = Skeleton.simple_merge([ skeletons[segid], hole_skel ])
+      else:
+        skeletons[segid] = hole_skel
+
+    return skeletons
 
   def voxel_connectivity_graph(
     self, 
@@ -393,15 +409,13 @@ class SkeletonTask(RegisteredTask):
     big_bbox.grow(delta)
     big_bbox = Bbox.clamp(big_bbox, vol.bounds)
 
-    big_bbox.minpt -= self.hole_filling_padding
-    big_bbox.maxpt += self.hole_filling_padding
-
     true_delta = bbox.minpt - big_bbox.minpt
 
     # place the skeletons in exactly the same position
     # in the enlarged image
-    for skel in skeletons.values():
-      skel.vertices += true_delta * vol.resolution
+    for label in skeletons.keys():
+      skeletons[label] = skeletons[label].voxel_space()
+      skeletons[label].vertices += true_delta
 
     mapping = {}
 
@@ -439,9 +453,10 @@ class SkeletonTask(RegisteredTask):
         progress=self.progress,
         in_place=True,
         fill_holes=False,
+        multipass=True,
       )
 
-    skeletons = self._do_operation(download_all_labels, do_cross_section)
+    skeletons, _ = self._do_operation(vol, download_all_labels, do_cross_section)
 
     mapping = { v:k for k,v in mapping.items() }
     skeletons = {
@@ -452,13 +467,109 @@ class SkeletonTask(RegisteredTask):
       skel.id = sid
 
     # move the vertices back to their old smaller image location
-    for skel in skeletons.values():
-      skel.vertices -= true_delta * vol.resolution
+    for label in skeletons.keys():
+      skel = skeletons[label]
+      skel.vertices -= true_delta # move the vertices back to their old smaller image location
+      skeletons[label] = skel.physical_space()
 
-    if self.cross_sectional_area_repair_sec_per_label != 0:
-      return self.repair_cross_sectional_area_contacts(vol, bbox, skeletons)
-    else:
+    return skeletons
+
+  def compute_cross_sectional_area_low_mem(self, vol, bbox, skeletons):
+    if len(skeletons) == 0:
       return skeletons
+
+    # Why redownload a bigger image? In order to avoid clipping the
+    # cross sectional areas on the edges.
+    delta = int(self.cross_sectional_area_shape_delta)
+
+    big_bbox = bbox.clone()
+    big_bbox.grow(delta)
+    big_bbox = Bbox.clamp(big_bbox, vol.bounds)
+
+    true_delta = bbox.minpt - big_bbox.minpt
+
+    # place the skeletons in exactly the same position
+    # in the enlarged image
+    for label in skeletons.keys():
+      skeletons[label] = skeletons[label].voxel_space()
+      skeletons[label].vertices += true_delta
+
+    all_labels = vol.download(big_bbox, crackle=True)
+    all_labels.parallel = self.parallel
+    
+    bbxes = all_labels.bounding_boxes(no_slice_conversion=True)
+    skel_labels = [ int(x) for x in skeletons.keys() ]
+
+    # For parallel=1, this gives better performance
+    # than decoding the crackle binary because 
+    # it exploits the chunked nature of the precomputed
+    # representation to avoid decoding many chunks
+    # but for parallel > 1, there's sufficient firepower
+    # to go faster decoding the crackle volume natively.
+    class BinaryImageIterator:
+      def __len__(self):
+        return len(skel_labels)
+      def __iter__(self):
+        for label in skel_labels:
+          bbx = Bbox.from_list(bbxes[label])
+          bbx.maxpt += 1
+          bbx = bbx.clone()
+          bbx += big_bbox.minpt
+          yield label, vol.download(bbx, label=label)[...,0]
+
+    if self.parallel == 1:
+      iterator = BinaryImageIterator()
+      del all_labels
+    else:
+      iterator = all_labels.each(
+        crop=True, 
+        labels=skel_labels,
+      )
+
+    hp = 2 # hole padding for morphological closure
+
+    with tqdm(
+      iterator,
+      disable=(not self.progress),
+      desc="Cross Sectional Area Analysis",
+    ) as pbar:
+      for label, binimg in pbar:
+        pbar.set_postfix(label=str(label))
+
+        if self.fill_holes > 0:
+          if self.fill_holes >= 3:
+            binimg = np.pad(binimg, pad_width=hp, mode='constant')
+
+          binimg = fastmorph.fill_holes_v1(
+            binimg,
+            remove_enclosed=True,
+            fix_borders=(self.fill_holes >= 2),
+            morphological_closing=(self.fill_holes >= 3),
+            progress=False,
+            parallel=self.parallel,
+          )
+
+          if self.fill_holes >= 3:
+            binimg = np.asfortranarray(binimg[hp:-hp,hp:-hp,hp:-hp])
+
+        bbx = Bbox.from_list(bbxes[label])
+        bbx.maxpt += 1
+
+        skeletons[label] = kimimaro.cross_sectional_area_single(
+          binimg, skeletons[label],
+          anisotropy=vol.resolution,
+          smoothing_window=self.cross_sectional_area_smoothing_window,
+          progress=False,
+          in_place=True,
+          roi=bbx,
+        )
+
+    for label in skeletons.keys():
+      skel = skeletons[label]
+      skel.vertices -= true_delta # move the vertices back to their old smaller image location
+      skeletons[label] = skel.physical_space()
+
+    return skeletons
 
   def repair_cross_sectional_area_contacts(self, vol, bbox, skeletons):
     from dbscan import DBSCAN
@@ -504,9 +615,6 @@ class SkeletonTask(RegisteredTask):
 
       skel_bbx = Bbox.clamp(skel_bbx, vol.bounds)
 
-      skel_bbx.minpt -= self.hole_filling_padding
-      skel_bbx.maxpt += self.hole_filling_padding
-
       binary_image = vol.download(
         skel_bbx, mip=vol.mip, label=skel.id
       )[...,0]
@@ -519,14 +627,22 @@ class SkeletonTask(RegisteredTask):
       segid = skel.id
       skel.id = 1
 
+      hp = 2 # hole padding
+
       if self.fill_holes > 0:
-        binary_image = fastmorph.fill_holes(
+        if self.fill_holes >= 3:
+          binary_image = np.pad(binary_image, pad_width=hp, mode='constant')
+
+        binary_image = fastmorph.fill_holes_v1(
           binary_image,
+          remove_enclosed=True,
           fix_borders=(self.fill_holes >= 2),
           morphological_closing=(self.fill_holes >= 3),
+          progress=False,
+          parallel=self.parallel,
         )
+
         if self.fill_holes >= 3:
-          hp = self.hole_filling_padding
           binary_image = np.asfortranarray(binary_image[hp:-hp,hp:-hp,hp:-hp])
           skel.vertices -= hp * vol.resolution
 
@@ -984,8 +1100,8 @@ def ShardedFromUnshardedSkeletonMergeTask(
 ):
   cv_src = CloudVolume(src)
 
-  if skel_dir is None and 'skeletons' in cv.info:
-    skel_dir = cv.info['skeletons']
+  if skel_dir is None and 'skeletons' in cv_src.info:
+    skel_dir = cv_src.info['skeletons']
 
   cv_dest = CloudVolume(dest, skel_dir=skel_dir, progress=progress)
 

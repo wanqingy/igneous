@@ -9,12 +9,30 @@ spec:
   selector:
     matchLabels:
       app: igneous
+  strategy:
+    type: Recreate
   template:
     metadata:
       labels:
         app: igneous
     spec:
       dnsPolicy: Default
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: "kubernetes.io/hostname"
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: igneous
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: "kubernetes.io/hostname"
+                labelSelector:
+                  matchLabels:
+                    app: igneous
       containers:
         - name: igneous
           image: seunglab/igneous
@@ -31,9 +49,11 @@ spec:
           imagePullPolicy: Always
           resources:
             requests:
-              memory: 2.5Gi
+              cpu: "1000m"       # reserve 1 vCPU per worker
+              memory: "8Gi"      # reserve 8 GiB per worker
             limits:
-              memory: 7.5Gi
+              cpu: "1000m"
+              memory: "50Gi"     # allow occasional RAM spike
           env:
             - name: SQS_URL
               value: 'sqs://QUEUE_NAME'
