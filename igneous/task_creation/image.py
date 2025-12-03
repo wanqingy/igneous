@@ -521,7 +521,7 @@ def create_image_shard_transfer_tasks(
   clean_info: bool = False,
   encoding_level: Optional[int] = None,
   truncate_scales: bool = True,
-  compress:Union[bool,str] = "auto",
+  compress:bool = True,
   cutout:bool = False,
   minishard_index_encoding:str = "gzip",
   stop_layer:Optional[int] = None,
@@ -544,16 +544,6 @@ def create_image_shard_transfer_tasks(
     chunk_size, truncate_scales,
     clean_info, cutout, bounds
   )
-
-  if compress == "auto":
-    compress = _select_compression_by_encoding(dest_vol.encoding)
-
-  if compress in (True, "gzip"):
-    compress = True
-  elif isinstance(compress, str):
-    raise ValueError(f"{compress} can only be True or 'gzip' for sharded images.")
-  else:
-    compress = False
 
   # If translate is not set, but dest_voxel_offset is then it should naturally be
   # only be the difference between datasets.
@@ -866,17 +856,8 @@ def create_transfer_cloudvolume(
 
   return dest_vol
 
-def _select_compression_by_encoding(encoding:str) -> Union[bool,str]:
-  encoding = encoding.lower()
-
-  if encoding in ("raw", "compressed_segmentation", "compresso", "crackle"):
-    return "gzip"
-  
-  return False
-
 def create_transfer_tasks(
-  src_layer_path:str, 
-  dest_layer_path:str, 
+  src_layer_path:str, dest_layer_path:str, 
   chunk_size:ShapeType = None, 
   shape:ShapeType = None, 
   fill_missing:bool = False, 
@@ -884,13 +865,13 @@ def create_transfer_tasks(
   bounds:Optional[Bbox] = None, 
   mip:int = 0, 
   preserve_chunk_size:bool = True,
-  encoding:Optional[str] = None,
+  encoding=None, 
   skip_downsamples:bool = False,
   delete_black_uploads:bool = False, 
   background_color:int = 0,
   agglomerate:bool = False, 
   timestamp:Optional[int] = None, 
-  compress:Union[str,bool] = "auto",
+  compress:Union[str,bool] = 'gzip',
   factor:ShapeType = None, 
   sparse:bool = False, 
   dest_voxel_offset:ShapeType = None,
@@ -933,7 +914,7 @@ def create_transfer_tasks(
   clean_info: scrub additional fields from the info file that might interfere
     with later processing (e.g. mesh and skeleton related info).
   compress: None, 'gzip', or 'br' Determines which compression algorithm to use 
-    for new uploaded files. if "auto", let Igneous pick for you.
+    for new uploaded files.
   delete_black_uploads: issue delete commands instead of upload chunks
     that are all background.
   encoding: "raw", "jpeg", "compressed_segmentation", "compresso", "fpzip", or "kempressed"
@@ -1008,9 +989,6 @@ def create_transfer_tasks(
     clean_info, cutout, bounds
   )
 
-  if compress == "auto":
-    compress = _select_compression_by_encoding(dest_vol.encoding)
-    
   # If translate is not set, but dest_voxel_offset is then it should naturally be
   # only be the difference between datasets.
   if translate is None:
@@ -1718,6 +1696,7 @@ def create_ccl_face_tasks(
   threshold_lte:Optional[Union[float,int]] = None,
   fill_missing:bool = False,
   dust_threshold:int = 0,
+  ccl_method:str = "cc3d",  # "cc3d", "skeleton", or "skeleton_oversegment"
 ):
   """pass 1"""
   vol = CloudVolume(cloudpath, mip=mip)
@@ -1736,6 +1715,7 @@ def create_ccl_face_tasks(
         threshold_lte=threshold_lte,
         fill_missing=fill_missing,
         dust_threshold=dust_threshold,
+        ccl_method=ccl_method,
       )
 
     def on_finish(self):
@@ -1749,6 +1729,7 @@ def create_ccl_face_tasks(
           'threshold_lte': threshold_lte,
           'fill_missing': bool(fill_missing),
           'dust_threshold': dust_threshold,
+          'ccl_method': ccl_method,
         },
         'by': operator_contact(),
         'date': strftime('%Y-%m-%d %H:%M %Z'),
@@ -1763,6 +1744,7 @@ def create_ccl_equivalence_tasks(
   threshold_lte:Optional[Union[float,int]] = None,
   fill_missing:bool = False,
   dust_threshold:int = 0,
+  ccl_method:str = "cc3d",  # "cc3d", "skeleton", or "skeleton_oversegment"
 ):
   """pass 2. Note: shape MUST match pass 1."""
   vol = CloudVolume(cloudpath, mip=mip)
@@ -1781,6 +1763,7 @@ def create_ccl_equivalence_tasks(
         threshold_lte=threshold_lte,
         fill_missing=fill_missing,
         dust_threshold=dust_threshold,
+        ccl_method=ccl_method,
       )
 
     def on_finish(self):
@@ -1794,6 +1777,7 @@ def create_ccl_equivalence_tasks(
           'threshold_lte': threshold_lte,
           'fill_missing': bool(fill_missing),
           'dust_threshold': dust_threshold,
+          'ccl_method': ccl_method,
         },
         'by': operator_contact(),
         'date': strftime('%Y-%m-%d %H:%M %Z'),
@@ -1810,6 +1794,7 @@ def create_ccl_relabel_tasks(
   threshold_lte:Optional[Union[float,int]] = None,
   fill_missing:bool = False,
   dust_threshold:int = 0,
+  ccl_method:str = "cc3d",  # "cc3d", "skeleton", or "skeleton_oversegment"
 ):
   """pass 3"""
 
@@ -1855,6 +1840,7 @@ def create_ccl_relabel_tasks(
         threshold_lte=threshold_lte,
         fill_missing=fill_missing,
         dust_threshold=dust_threshold,
+        ccl_method=ccl_method,
       )
 
     def on_finish(self):
@@ -1869,6 +1855,7 @@ def create_ccl_relabel_tasks(
           'threshold_lte': threshold_lte,
           'fill_missing': bool(fill_missing),
           'dust_threshold': dust_threshold,
+          'ccl_method': ccl_method,
         },
         'by': operator_contact(),
         'date': strftime('%Y-%m-%d %H:%M %Z'),
@@ -2045,4 +2032,3 @@ def compute_rois(
   cv.commit_info()
 
   return bboxes
-

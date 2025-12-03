@@ -187,10 +187,8 @@ def skeleton_based_connected_components(
 
     # Step 4: Ensure each component is contiguous, using modular helper
     final_labels, N = make_components_contiguous(cc_labels, out_dtype)
-    print(f"Final number of connected components: {len(unique_labels)}")
 
     if return_N:
-        N = len(unique_labels)
         return final_labels, N
     else:
         return final_labels
@@ -381,7 +379,7 @@ def skeleton_based_connected_components_with_oversegment(
 
     branch_removed_skeletons = split_at_branch_nodes(skeletons_dict)
     try:
-        overseg_labels, updated_skeletons = oversegment_image(labels.astype(np.uint8), branch_removed_skeletons, downsample=downsample)
+        overseg_labels, updated_skeletons = oversegment_image(binary_labels.astype(np.uint8), branch_removed_skeletons, downsample=downsample)
         # --- LOGGING MISSED FOREGROUND VOXELS ---
         missed_mask = (binary_labels > 0) & (overseg_labels == 0)
         missed_count = np.count_nonzero(missed_mask)
@@ -414,7 +412,6 @@ def regroup_using_segments_attribute(overseg_labels, updated_skeletons, out_dtyp
     2. For each component, comp.segments directly gives supervoxel IDs
     3. Remap all those supervoxels to a new component ID
     """
-    result = np.zeros_like(overseg_labels, dtype=out_dtype)
     next_component_id = 1
     supervoxel_to_component = {}
     
@@ -436,24 +433,43 @@ def regroup_using_segments_attribute(overseg_labels, updated_skeletons, out_dtyp
                 
             # Step 3: comp.segments directly gives us the supervoxel IDs!
             if hasattr(comp, 'segments') and comp.segments is not None:
-                # comp_supervoxel_ids = set(comp.segments)
-                # comp_supervoxel_ids.discard(0)  # Remove background
+                # Get unique segments excluding background
+                unique_segments = set(comp.segments)
+                unique_segments.discard(0)  # Remove background
                 
-                # Remap all supervoxels in this component to the same new component ID
-                # for supervoxel_id in comp_supervoxel_ids:
-                #     mask = (overseg_labels == supervoxel_id)
-                #     result[mask] = next_component_id
+                for supervoxel_id in unique_segments:
+                    supervoxel_to_component[supervoxel_id] = next_component_id
                 
-                # if len(comp_supervoxel_ids) > 0:
-                #     next_component_id += 1
-                for supervoxel_id in set(comp.segments):
-                  supervoxel_to_component[supervoxel_id] = next_component_id
-                if len(set(comp.segments)) > 0:
-                  next_component_id += 1
+                # Only increment if we actually mapped non-background segments
+                if len(unique_segments) > 0:
+                    next_component_id += 1
 
+    # Log unmapped supervoxels for debugging
+    all_supervoxels = set(np.unique(overseg_labels))
+    all_supervoxels.discard(0)  # Remove background
+    mapped_supervoxels = set(supervoxel_to_component.keys())
+    unmapped = all_supervoxels - mapped_supervoxels
+    
+    if unmapped:
+        print(f"[regroup] WARNING: {len(unmapped)} supervoxels not mapped by skeletons")
+        print(f"[regroup] Preserving unmapped supervoxels as separate components")
+        print(f"[regroup] Example unmapped supervoxel IDs: {sorted(list(unmapped))[:20]}")
+        # Assign each unmapped supervoxel to its own component ID
+        for sv_id in sorted(unmapped):  # Sort for determinism
+            supervoxel_to_component[sv_id] = next_component_id
+            next_component_id += 1
+    
     # Use fastremap for efficient mapping
-    result = fastremap.remap(overseg_labels, supervoxel_to_component, in_place=False, preserve_missing_labels=True)
+    # Now all supervoxels are explicitly mapped
+    result = fastremap.remap(
+        overseg_labels, 
+        supervoxel_to_component, 
+        in_place=False, 
+        preserve_missing_labels=True
+    )
     result = result.astype(out_dtype)
+    
+    print(f"[regroup] Mapped to {next_component_id - 1} components (including {len(unmapped)} preserved unmapped)")
     
     return result
 
@@ -465,6 +481,7 @@ def CCLFacesTask(
   threshold_lte:Optional[Union[float,int]] = None,
   fill_missing:bool = False,
   dust_threshold:int = 0,
+  ccl_method:str = "cc3d",  # "cc3d", "skeleton", or "skeleton_oversegment"
 ):
   """
   (1) Generate x,y,z back faces of each 1vx overlap task
@@ -504,10 +521,19 @@ def CCLFacesTask(
       labels, threshold=dust_threshold, 
       connectivity=6, in_place=True
     )
-  # cc_labels = cc3d.connected_components(labels, connectivity=6, out_dtype=np.uint64)
-  # cc_labels = skeleton_based_connected_components(labels, out_dtype=np.uint64)
-  cc_labels = skeleton_based_connected_components_with_oversegment(labels, out_dtype=np.uint64)
-  labels = cc_labels.copy()
+  
+  # Select CCL method
+  if ccl_method == "cc3d":
+    cc_labels = cc3d.connected_components(labels, connectivity=6, out_dtype=np.uint64)
+  elif ccl_method == "skeleton":
+    cc_labels = skeleton_based_connected_components(labels, out_dtype=np.uint64)
+    labels = cc_labels.copy()
+  elif ccl_method == "skeleton_oversegment":
+    cc_labels = skeleton_based_connected_components_with_oversegment(labels, out_dtype=np.uint64)
+    labels = cc_labels.copy()
+  else:
+    raise ValueError(f"Unknown ccl_method: {ccl_method}. Choose 'cc3d', 'skeleton', or 'skeleton_oversegment'.")
+
   cc_labels += np.uint64(label_offset)
   cc_labels[labels == 0] = 0
 
@@ -538,6 +564,7 @@ def CCLEquivalancesTask(
   threshold_lte:Optional[Union[float,int]] = None,
   fill_missing:bool = False,
   dust_threshold:int = 0,
+  ccl_method:str = "cc3d",  # "cc3d", "skeleton", or "skeleton_oversegment"
 ):
   """
   (2) Generate linkages between tasks by comparing the 
@@ -569,20 +596,19 @@ def CCLEquivalancesTask(
       labels, threshold=dust_threshold, 
       connectivity=6, in_place=True
     )
-  # cc_labels, N = cc3d.connected_components(
-  #   labels, connectivity=6, 
-  #   out_dtype=np.uint64, return_N=True
-  # )
-  # cc_labels, N = skeleton_based_connected_components(
-  #   labels,  
-  #   out_dtype=np.uint64, return_N=True
-  # )
-  cc_labels, N = skeleton_based_connected_components_with_oversegment(
-     labels, 
-     out_dtype=np.uint64,
-     return_N=True
-  )
-  labels = cc_labels.copy()
+
+  # Select CCL method
+  if ccl_method == "cc3d":
+    cc_labels, N = cc3d.connected_components(labels, connectivity=6, out_dtype=np.uint64, return_N=True)
+  elif ccl_method == "skeleton":
+    cc_labels, N = skeleton_based_connected_components(labels, out_dtype=np.uint64, return_N=True)
+    labels = cc_labels.copy()
+  elif ccl_method == "skeleton_oversegment":
+    cc_labels, N = skeleton_based_connected_components_with_oversegment(labels, out_dtype=np.uint64, return_N=True)
+    labels = cc_labels.copy()
+  else:
+    raise ValueError(f"Unknown ccl_method: {ccl_method}. Choose 'cc3d', 'skeleton', or 'skeleton_oversegment'.")
+
   cc_labels += np.uint64(label_offset)
   cc_labels[labels == 0] = 0
 
@@ -648,6 +674,7 @@ def RelabelCCLTask(
   threshold_lte:Optional[Union[float,int]] = None,
   fill_missing:bool = False,
   dust_threshold:int = 0,
+  ccl_method:str = "cc3d",  # "cc3d", "skeleton", or "skeleton_oversegment"
 ):
   """
   (4) Retrieves the relabeling for this task from the
@@ -683,20 +710,18 @@ def RelabelCCLTask(
       labels, threshold=dust_threshold, 
       connectivity=6, in_place=True
     )
-  # cc_labels, N = cc3d.connected_components(
-  #   labels, connectivity=6, 
-  #   out_dtype=np.uint64, return_N=True
-  # )
-  # cc_labels, N = skeleton_based_connected_components(
-  #   labels, 
-  #   out_dtype=np.uint64, return_N=True
-  # )
-  cc_labels, N = skeleton_based_connected_components_with_oversegment(
-     labels, 
-     out_dtype=np.uint64,
-     return_N=True
-  )
-  labels = cc_labels.copy()
+  # Select CCL method
+  if ccl_method == "cc3d":
+    cc_labels, N = cc3d.connected_components(labels, connectivity=6, out_dtype=np.uint64, return_N=True)
+  elif ccl_method == "skeleton":
+    cc_labels, N = skeleton_based_connected_components(labels, out_dtype=np.uint64, return_N=True)
+    labels = cc_labels.copy()
+  elif ccl_method == "skeleton_oversegment":
+    cc_labels, N = skeleton_based_connected_components_with_oversegment(labels, out_dtype=np.uint64, return_N=True)
+    labels = cc_labels.copy()
+  else:
+    raise ValueError(f"Unknown ccl_method: {ccl_method}. Choose 'cc3d', 'skeleton', or 'skeleton_oversegment'.")
+
   cc_labels += np.uint64(label_offset)
   cc_labels[labels == 0] = 0
 

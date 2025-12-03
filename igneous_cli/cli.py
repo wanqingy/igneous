@@ -686,11 +686,12 @@ def cclgroup():
 @click.option('--threshold-lte', default=None, type=str, help="Threshold source image using image <= value.", show_default=True)
 @click.option('--fill-missing', is_flag=True, default=False, help="Interpret missing image files as background instead of failing.", show_default=True)
 @click.option('--dust', default=0, help="Delete objects smaller than this number of voxels within a cutout.", show_default=True)
+@click.option('--ccl-method', default="cc3d", help="CCL method: 'cc3d', 'skeleton', or 'skeleton_oversegment'.", show_default=True)
 @click.pass_context
 def ccl_faces(
   ctx, src, mip, shape, queue,
   threshold_lte, threshold_gte,
-  fill_missing, dust
+  fill_missing, dust, ccl_method
 ):
   """(1) Generate back face images."""
   tasks = tc.create_ccl_face_tasks(
@@ -699,6 +700,7 @@ def ccl_faces(
     threshold_gte=numberify(threshold_gte),
     fill_missing=fill_missing,
     dust_threshold=dust,
+    ccl_method=ccl_method,
   )
 
   enqueue_tasks(ctx, queue, tasks)
@@ -712,11 +714,12 @@ def ccl_faces(
 @click.option('--threshold-lte', default=None, type=str, help="Threshold source image using image <= value.", show_default=True)
 @click.option('--fill-missing', is_flag=True, default=False, help="Interpret missing image files as background instead of failing.", show_default=True)
 @click.option('--dust', default=0, help="Delete objects smaller than this number of voxels within a cutout.", show_default=True)
+@click.option('--ccl-method', default="cc3d", help="CCL method: 'cc3d', 'skeleton', or 'skeleton_oversegment'.", show_default=True)
 @click.pass_context
 def ccl_equivalences(
   ctx, src, mip, shape, queue,
   threshold_lte, threshold_gte,
-  fill_missing, dust
+  fill_missing, dust, ccl_method
 ):
   """(2) Generate links between tasks."""
   tasks = tc.create_ccl_equivalence_tasks(
@@ -725,6 +728,7 @@ def ccl_equivalences(
     threshold_gte=numberify(threshold_gte),
     fill_missing=fill_missing,
     dust_threshold=dust,
+    ccl_method=ccl_method,
   )
 
   enqueue_tasks(ctx, queue, tasks)
@@ -751,13 +755,14 @@ def ccl_calc_labels(ctx, src, mip, shape):
 @click.option('--threshold-lte', default=None, type=str, help="Threshold source image using image <= value.", show_default=True)
 @click.option('--fill-missing', is_flag=True, default=False, help="Interpret missing image files as background instead of failing.", show_default=True)
 @click.option('--dust', default=0, help="Delete objects smaller than this number of voxels within a cutout.", show_default=True)
+@click.option('--ccl-method', default="cc3d", help="CCL method: 'cc3d', 'skeleton', or 'skeleton_oversegment'.", show_default=True)
 @click.pass_context
 def ccl_relabel(
   ctx, src, dest, 
   shape, mip, chunk_size, 
   encoding, queue,
   threshold_lte, threshold_gte,
-  fill_missing, dust
+  fill_missing, dust, ccl_method
 ):
   """(4) Finally relabel and write a CCL image."""
   tasks = tc.create_ccl_relabel_tasks(
@@ -768,6 +773,7 @@ def ccl_relabel(
     threshold_gte=numberify(threshold_gte),
     fill_missing=fill_missing,
     dust_threshold=dust,
+    ccl_method=ccl_method,
   )
 
   enqueue_tasks(ctx, queue, tasks)
@@ -793,6 +799,7 @@ def ccl_clean(src, mip):
 @click.option('--threshold-lte', default=None, type=str, help="Threshold source image using image <= value.", show_default=True)
 @click.option('--fill-missing', is_flag=True, default=False, help="Interpret missing image files as background instead of failing.", show_default=True)
 @click.option('--dust', default=0, help="Delete objects smaller than this number of voxels within a cutout.", show_default=True)
+@click.option('--ccl-method', default="cc3d", help="CCL method: 'cc3d', 'skeleton', or 'skeleton_oversegment'.", show_default=True)
 @click.pass_context
 def ccl_auto(
   ctx, src, dest, 
@@ -800,7 +807,7 @@ def ccl_auto(
   chunk_size, encoding, 
   queue, clean,
   threshold_lte, threshold_gte,
-  fill_missing, dust
+  fill_missing, dust, ccl_method
 ):
   """
   For local volumes, execute all steps automatically.
@@ -814,6 +821,7 @@ def ccl_auto(
     threshold_gte=numberify(threshold_gte),
     fill_missing=fill_missing,
     dust_threshold=dust,
+    ccl_method=ccl_method,
   )
   enqueue_tasks(ctx, queue, tasks)
   if queue:
@@ -825,6 +833,7 @@ def ccl_auto(
     threshold_gte=numberify(threshold_gte),
     fill_missing=fill_missing,
     dust_threshold=dust,
+    ccl_method=ccl_method,
   )
   enqueue_tasks(ctx, queue, tasks)
   if queue:
@@ -841,6 +850,7 @@ def ccl_auto(
     threshold_gte=numberify(threshold_gte),
     fill_missing=fill_missing,
     dust_threshold=dust,
+    ccl_method=ccl_method,
   )
   enqueue_tasks(ctx, queue, tasks)
   if queue:
@@ -1302,6 +1312,7 @@ def skeletongroup():
 @click.option('--timestamp', type=int, default=None, help="(graphene) Use the proofreading state at this UNIX timestamp.", show_default=True)
 @click.option('--root-ids', type=CloudPath(), default=None, help="(graphene) If you have a materialization of graphene root ids for this timepoint, it's more efficient to use it than making requests to the graphene server.", show_default=True)
 @click.option('--progress', is_flag=True, default=False, help="Print progress bars.", show_default=True)
+@click.option('--split-at-branches', is_flag=True, default=False, help="Split skeletons at branch points. Surface-touching fragments get original IDs and will be merged across chunks. Interior skeletons get unique IDs and are finalized.", show_default=True)
 @click.pass_context
 def skeleton_forge(
   ctx, path, queue, mip, shape, 
@@ -1310,7 +1321,7 @@ def skeleton_forge(
   fill_holes, scale, const, soma_detect, soma_accept,
   soma_scale, soma_const, max_paths, sharded, labels,
   cross_section, output, timestamp, root_ids, progress,
-  cross_section_label_repair_sec,
+  cross_section_label_repair_sec, split_at_branches,
 ):
   """
   (1) Synthesize skeletons from segmentation cutouts.
@@ -1358,6 +1369,7 @@ def skeleton_forge(
     frag_path=output, fix_autapses=fix_autapses,
     timestamp=timestamp, root_ids_cloudpath=root_ids,
     cross_sectional_area_repair_sec_per_label=cross_section_label_repair_sec,
+    split_at_branches=split_at_branches,
   )
 
   enqueue_tasks(ctx, queue, tasks)
