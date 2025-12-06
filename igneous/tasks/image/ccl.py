@@ -728,7 +728,7 @@ def RelabelCCLTask(
   cc_labels = fastremap.remap(cc_labels, mapping, in_place=True)
 
   # Final upload without overlap
-  dest_cv = CloudVolume(dest_path, mip=mip)
+  dest_cv = CloudVolume(dest_path, mip=mip, compress=False)
   bounds = Bbox(offset, offset + shape)
   bounds = Bbox.clamp(bounds, dest_cv.meta.bounds(mip))
   shape = bounds.size3()
