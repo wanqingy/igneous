@@ -412,6 +412,7 @@ def regroup_using_segments_attribute(overseg_labels, updated_skeletons, out_dtyp
     2. For each component, comp.segments directly gives supervoxel IDs
     3. Remap all those supervoxels to a new component ID
     """
+    result = np.zeros_like(overseg_labels, dtype=out_dtype)
     next_component_id = 1
     supervoxel_to_component = {}
     
