@@ -26,3 +26,4 @@ tqdm
 trimesh[easy]
 xs3d>=1.12.2
 zmesh>=1.9.0,<2.0
+osteoid==0.5.0
