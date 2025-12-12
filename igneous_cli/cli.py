@@ -1312,7 +1312,7 @@ def skeletongroup():
 @click.option('--timestamp', type=int, default=None, help="(graphene) Use the proofreading state at this UNIX timestamp.", show_default=True)
 @click.option('--root-ids', type=CloudPath(), default=None, help="(graphene) If you have a materialization of graphene root ids for this timepoint, it's more efficient to use it than making requests to the graphene server.", show_default=True)
 @click.option('--progress', is_flag=True, default=False, help="Print progress bars.", show_default=True)
-@click.option('--split-at-branches', is_flag=True, default=False, help="Split skeletons at branch points. Surface-touching fragments get original IDs and will be merged across chunks. Interior skeletons get unique IDs and are finalized.", show_default=True)
+# @click.option('--split-at-branches', is_flag=True, default=False, help="Split skeletons at branch points. Surface-touching fragments get original IDs and will be merged across chunks. Interior skeletons get unique IDs and are finalized.", show_default=True)
 @click.pass_context
 def skeleton_forge(
   ctx, path, queue, mip, shape, 
